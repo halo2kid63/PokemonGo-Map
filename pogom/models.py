@@ -1,15 +1,15 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
+
 import logging
+import os
 import calendar
-import sys
-from peewee import SqliteDatabase, InsertQuery, \
-    IntegerField, CharField, DoubleField, BooleanField, \
-    DateTimeField, CompositeKey, fn
+from peewee import Model, SqliteDatabase, InsertQuery,\
+                   IntegerField, CharField, DoubleField, BooleanField,\
+                   DateTimeField, OperationalError, create_model_tables, fn
 from playhouse.flask_utils import FlaskDB
 from playhouse.pool import PooledMySQLDatabase
 from playhouse.shortcuts import RetryOperationalError
-from playhouse.migrate import migrate, MySQLMigrator, SqliteMigrator
 from datetime import datetime, timedelta
 from base64 import b64encode
 
@@ -23,8 +23,6 @@ log = logging.getLogger(__name__)
 args = get_args()
 flaskDb = FlaskDB()
 
-db_schema_version = 4
-
 
 class MyRetryDB(RetryOperationalError, PooledMySQLDatabase):
     pass
@@ -33,16 +31,13 @@ class MyRetryDB(RetryOperationalError, PooledMySQLDatabase):
 def init_database(app):
     if args.db_type == 'mysql':
         log.info('Connecting to MySQL database on %s:%i', args.db_host, args.db_port)
-        connections = args.db_max_connections
-        if hasattr(args, 'accounts'):
-            connections *= len(args.accounts)
         db = MyRetryDB(
             args.db_name,
             user=args.db_user,
             password=args.db_pass,
             host=args.db_host,
             port=args.db_port,
-            max_connections=connections,
+            max_connections=args.db_max_connections,
             stale_timeout=300)
     else:
         log.info('Connecting to local SQLite database')
@@ -177,7 +172,7 @@ class Pokemon(BaseModel):
         query = (Pokemon
                  .select()
                  .where((Pokemon.pokemon_id == pokemon_id) &
-                        (Pokemon.disappear_time > datetime.utcfromtimestamp(last_appearance / 1000.0))
+                        (Pokemon.disappear_time > datetime.utcfromtimestamp(last_appearance/1000.0))
                         )
                  .order_by(Pokemon.disappear_time.asc())
                  .dicts()
@@ -187,24 +182,6 @@ class Pokemon(BaseModel):
             appearances.append(a)
         return appearances
 
-    @classmethod
-    def get_spawnpoints(cls, swLat, swLng, neLat, neLng):
-        query = Pokemon.select(Pokemon.latitude, Pokemon.longitude, Pokemon.spawnpoint_id)
-
-        if None not in (swLat, swLng, neLat, neLng):
-            query = (query
-                     .where((Pokemon.latitude >= swLat) &
-                            (Pokemon.longitude >= swLng) &
-                            (Pokemon.latitude <= neLat) &
-                            (Pokemon.longitude <= neLng)
-                            )
-                     )
-
-        query = query.group_by(Pokemon.spawnpoint_id).dicts()
-
-        return list(query)
-
-
 class Pokestop(BaseModel):
     pokestop_id = CharField(primary_key=True, max_length=50)
     enabled = BooleanField()
@@ -212,7 +189,7 @@ class Pokestop(BaseModel):
     longitude = DoubleField()
     last_modified = DateTimeField(index=True)
     lure_expiration = DateTimeField(null=True, index=True)
-    active_fort_modifier = CharField(max_length=50, null=True)
+    active_pokemon_id = IntegerField(null=True)
 
     class Meta:
         indexes = ((('latitude', 'longitude'), False),)
@@ -283,12 +260,13 @@ class Gym(BaseModel):
 
 
 class ScannedLocation(BaseModel):
+    scanned_id = CharField(primary_key=True, max_length=50)
     latitude = DoubleField()
     longitude = DoubleField()
     last_modified = DateTimeField(index=True)
 
     class Meta:
-        primary_key = CompositeKey('latitude', 'longitude')
+        indexes = ((('latitude', 'longitude'), False),)
 
     @staticmethod
     def get_recent(swLat, swLng, neLat, neLng):
@@ -309,14 +287,6 @@ class ScannedLocation(BaseModel):
         return scans
 
 
-class Versions(flaskDb.Model):
-    key = CharField()
-    val = IntegerField()
-
-    class Meta:
-        primary_key = False
-
-
 def parse_map(map_dict, step_location):
     pokemons = {}
     pokestops = {}
@@ -327,14 +297,9 @@ def parse_map(map_dict, step_location):
     for cell in cells:
         if config['parse_pokemon']:
             for p in cell.get('wild_pokemons', []):
-                # time_till_hidden_ms was overflowing causing a negative integer. It was also returning a value above 3.6M ms.
-                if (0 < p['time_till_hidden_ms'] < 3600000):
-                    d_t = datetime.utcfromtimestamp(
-                        (p['last_modified_timestamp_ms'] +
-                         p['time_till_hidden_ms']) / 1000.0)
-                else:
-                    # Set a value of 15 minutes because currently its unknown but larger than 15.
-                    d_t = datetime.utcfromtimestamp((p['last_modified_timestamp_ms'] + 900000) / 1000.0)
+                d_t = datetime.utcfromtimestamp(
+                    (p['last_modified_timestamp_ms'] +
+                     p['time_till_hidden_ms']) / 1000.0)
                 printPokemon(p['pokemon_data']['pokemon_id'], p['latitude'],
                              p['longitude'], d_t)
                 pokemons[p['encounter_id']] = {
@@ -354,26 +319,31 @@ def parse_map(map_dict, step_location):
                     'longitude': p['longitude'],
                     'disappear_time': calendar.timegm(d_t.timetuple()),
                     'last_modified_time': p['last_modified_timestamp_ms'],
-                    'time_until_hidden_ms': p['time_till_hidden_ms']
+                    'time_until_hidden_ms': p['time_till_hidden_ms'],
+                    'is_lured': False
                 }
 
                 send_to_webhook('pokemon', webhook_data)
 
         for f in cell.get('forts', []):
             if config['parse_pokestops'] and f.get('type') == 1:  # Pokestops
-                if 'active_fort_modifier' in f:
+                if 'lure_info' in f:
                     lure_expiration = datetime.utcfromtimestamp(
-                        f['last_modified_timestamp_ms'] / 1000.0) + timedelta(minutes=30)
-                    active_fort_modifier = f['active_fort_modifier']
+                        f['lure_info']['lure_expires_timestamp_ms'] / 1000.0)
+                    active_pokemon_id = f['lure_info']['active_pokemon_id']
+                    encounter_id = f['lure_info']['encounter_id']
                     webhook_data = {
+                        'encounter_id': b64encode(str(encounter_id)),
+                        'pokemon_id': active_pokemon_id,
                         'latitude': f['latitude'],
                         'longitude': f['longitude'],
+                        'disappear_time': calendar.timegm(lure_expiration.timetuple()),
                         'last_modified_time': f['last_modified_timestamp_ms'],
-                        'active_fort_modifier': active_fort_modifier
+                        'is_lured': True
                     }
-                    send_to_webhook('pokestop', webhook_data)
+                    send_to_webhook('pokemon', webhook_data)
                 else:
-                    lure_expiration, active_fort_modifier = None, None
+                    lure_expiration, active_pokemon_id = None, None
 
                 pokestops[f['id']] = {
                     'pokestop_id': f['id'],
@@ -383,7 +353,7 @@ def parse_map(map_dict, step_location):
                     'last_modified': datetime.utcfromtimestamp(
                         f['last_modified_timestamp_ms'] / 1000.0),
                     'lure_expiration': lure_expiration,
-                    'active_fort_modifier': active_fort_modifier,
+                    'active_pokemon_id': active_pokemon_id
                 }
 
             elif config['parse_gyms'] and f.get('type') is None:  # Currently, there are only stops and gyms
@@ -403,19 +373,6 @@ def parse_map(map_dict, step_location):
     pokestops_upserted = 0
     gyms_upserted = 0
 
-    scanned[0] = {
-        'latitude': step_location[0],
-        'longitude': step_location[1],
-        'last_modified': datetime.utcnow(),
-    }
-
-    while True:
-        try:
-            flaskDb.connect_db()
-            break
-        except Exception as e:
-            log.warning('%s... Retrying', e)
-
     if pokemons and config['parse_pokemon']:
         pokemons_upserted = len(pokemons)
         bulk_upsert(Pokemon, pokemons)
@@ -428,33 +385,33 @@ def parse_map(map_dict, step_location):
         gyms_upserted = len(gyms)
         bulk_upsert(Gym, gyms)
 
+    log.info('Upserted %d pokemon, %d pokestops, and %d gyms',
+        pokemons_upserted,
+        pokestops_upserted,
+        gyms_upserted)
+
+    scanned[0] = {
+        'scanned_id': str(step_location[0])+','+str(step_location[1]),
+        'latitude': step_location[0],
+        'longitude': step_location[1],
+        'last_modified': datetime.utcnow(),
+    }
+
     bulk_upsert(ScannedLocation, scanned)
 
     clean_database()
-
-    flaskDb.close_db(None)
-
-    log.info('Upserted %d pokemon, %d pokestops, and %d gyms',
-             pokemons_upserted,
-             pokestops_upserted,
-             gyms_upserted)
 
     return True
 
 
 def clean_database():
+    flaskDb.connect_db()
     query = (ScannedLocation
-             .delete()
-             .where((ScannedLocation.last_modified <
-                    (datetime.utcnow() - timedelta(minutes=30)))))
+            .delete()
+            .where((ScannedLocation.last_modified <
+                (datetime.utcnow() - timedelta(minutes=30)))))
     query.execute()
-
-    if args.purge_data > 0:
-        query = (Pokemon
-                 .delete()
-                 .where((Pokemon.disappear_time <
-                        (datetime.utcnow() - timedelta(hours=args.purge_data)))))
-        query.execute()
+    flaskDb.close_db(None)
 
 
 def bulk_upsert(cls, data):
@@ -462,82 +419,27 @@ def bulk_upsert(cls, data):
     i = 0
     step = 120
 
+    flaskDb.connect_db()
+
     while i < num_rows:
-        log.debug('Inserting items %d to %d', i, min(i + step, num_rows))
+        log.debug('Inserting items %d to %d', i, min(i+step, num_rows))
         try:
-            InsertQuery(cls, rows=data.values()[i:min(i + step, num_rows)]).upsert().execute()
+            InsertQuery(cls, rows=data.values()[i:min(i+step, num_rows)]).upsert().execute()
         except Exception as e:
             log.warning('%s... Retrying', e)
             continue
 
-        i += step
+        i+=step
+
+    flaskDb.close_db(None)
 
 
 def create_tables(db):
     db.connect()
-    verify_database_schema(db)
     db.create_tables([Pokemon, Pokestop, Gym, ScannedLocation], safe=True)
     db.close()
 
-
 def drop_tables(db):
     db.connect()
-    db.drop_tables([Pokemon, Pokestop, Gym, ScannedLocation, Versions], safe=True)
+    db.drop_tables([Pokemon, Pokestop, Gym, ScannedLocation], safe=True)
     db.close()
-
-
-def verify_database_schema(db):
-    if not Versions.table_exists():
-        db.create_tables([Versions])
-
-        if ScannedLocation.table_exists():
-            # Versions table didn't exist, but there were tables. This must mean the user
-            # is coming from a database that existed before we started tracking the schema
-            # version. Perform a full upgrade.
-            InsertQuery(Versions, {Versions.key: 'schema_version', Versions.val: 0}).execute()
-            database_migrate(db, 0)
-        else:
-            InsertQuery(Versions, {Versions.key: 'schema_version', Versions.val: db_schema_version}).execute()
-
-    else:
-        db_ver = Versions.get(Versions.key == 'schema_version').val
-
-        if db_ver < db_schema_version:
-            database_migrate(db, db_ver)
-
-        elif db_ver > db_schema_version:
-            log.error("Your database version (%i) appears to be newer than the code supports (%i).",
-                      db_ver, db_schema_version)
-            log.error("Please upgrade your code base or drop all tables in your database.")
-            sys.exit(1)
-
-
-def database_migrate(db, old_ver):
-    log.info("Detected database version %i, updating to %i", old_ver, db_schema_version)
-
-    # Perform migrations here
-    migrator = None
-    if args.db_type == 'mysql':
-        migrator = MySQLMigrator(db)
-    else:
-        migrator = SqliteMigrator(db)
-
-#   No longer necessary, we're doing this at schema 4 as well
-#    if old_ver < 1:
-#        db.drop_tables([ScannedLocation])
-
-    if old_ver < 2:
-        migrate(migrator.add_column('pokestop', 'encounter_id', CharField(max_length=50, null=True)))
-
-    if old_ver < 3:
-        migrate(
-            migrator.add_column('pokestop', 'active_fort_modifier', CharField(max_length=50, null=True)),
-            migrator.drop_column('pokestop', 'encounter_id'),
-            migrator.drop_column('pokestop', 'active_pokemon_id')
-        )
-
-    if old_ver < 4:
-        db.drop_tables([ScannedLocation])
-
-    # Update database schema version
-    Versions.update(val=db_schema_version).where(Versions.key == 'schema_version').execute()
